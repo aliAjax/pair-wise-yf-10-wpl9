@@ -1,60 +1,8 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
-const path = require("path");
+const { readDb, writeDb, makeId } = require("./store");
+const { reconcileTune, reconcileAll, buildReviewProgress, enrichBand } = require("./faultBands");
 
 const PORT = Number(process.env.PORT || 3019);
-const DB_FILE = path.join(__dirname, "data", "db.json");
-
-const initialData = {
-  tunes: [
-    {
-      id: "tune_demo",
-      title: "雨后圆舞曲",
-      composer: "匿名",
-      stripSpec: {
-        widthMm: 70,
-        scale: "20音",
-        tempoBpm: 82,
-        paperType: "半透明纸带"
-      },
-      createdAt: new Date().toISOString()
-    }
-  ],
-  sections: [
-    {
-      id: "section_demo_1",
-      tuneId: "tune_demo",
-      startBeat: 1,
-      endBeat: 32,
-      laneRange: "1-10",
-      checked: true,
-      note: "开头主题已试奏"
-    },
-    {
-      id: "section_demo_2",
-      tuneId: "tune_demo",
-      startBeat: 33,
-      endBeat: 64,
-      laneRange: "4-18",
-      checked: false,
-      note: "副歌段等待校对"
-    }
-  ],
-  issues: [
-    {
-      id: "issue_demo",
-      tuneId: "tune_demo",
-      sectionId: "section_demo_2",
-      type: "漏孔",
-      beat: 41,
-      lane: 12,
-      description: "第41拍高音孔漏打",
-      status: "open",
-      createdAt: new Date().toISOString(),
-      resolvedAt: null
-    }
-  ]
-};
 
 const routes = [
   "GET /health",
@@ -67,26 +15,10 @@ const routes = [
   "PATCH /sections/:id/check",
   "GET /issues",
   "POST /issues",
-  "PATCH /issues/:id/status"
+  "PATCH /issues/:id/status",
+  "GET /tunes/:id/fault-bands",
+  "POST /tunes/:id/fault-bands/analyze"
 ];
-
-async function ensureDb() {
-  await mkdir(path.dirname(DB_FILE), { recursive: true });
-  try {
-    JSON.parse(await readFile(DB_FILE, "utf8"));
-  } catch {
-    await writeFile(DB_FILE, JSON.stringify(initialData, null, 2));
-  }
-}
-
-async function readDb() {
-  await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
-}
-
-async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
-}
 
 function send(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -111,10 +43,6 @@ async function parseBody(req) {
   }
 }
 
-function makeId(prefix) {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
 function required(body, fields) {
   const missing = fields.filter((field) => body[field] === undefined || body[field] === "");
   if (missing.length) {
@@ -134,6 +62,12 @@ function findTune(db, tuneId) {
   return tune;
 }
 
+// 登记/关闭问题或区间变化后重算该曲目的故障带，并把分析与复核状态落库
+async function recomputeAndSave(db, tuneId) {
+  reconcileTune(db, tuneId, { idMaker: makeId });
+  await writeDb(db);
+}
+
 function buildProgress(db, tuneId) {
   findTune(db, tuneId);
   const sections = db.sections.filter((item) => item.tuneId === tuneId);
@@ -145,10 +79,24 @@ function buildProgress(db, tuneId) {
     totalSections: sections.length,
     checkedSections: checkedCount,
     uncheckedSections: sections.length - checkedCount,
+    normalSections: sections.filter((item) => item.reviewState !== "pending_review").length,
+    pendingReviewSections: sections.filter((item) => item.reviewState === "pending_review").length,
     openIssues,
     resolvedIssues: issues.length - openIssues,
-    percent: sections.length ? Math.round((checkedCount / sections.length) * 100) : 0
+    percent: sections.length ? Math.round((checkedCount / sections.length) * 100) : 0,
+    // 故障带复核进度单列
+    review: buildReviewProgress(db, tuneId)
   };
+}
+
+function listFaultBands(db, tuneId, includeWithdrawn) {
+  const bands = db.faultBands.filter(
+    (band) => band.tuneId === tuneId && (includeWithdrawn || band.status === "active")
+  );
+  return bands
+    .slice()
+    .sort((a, b) => a.startBeat - b.startBeat || a.id.localeCompare(b.id))
+    .map((band) => ({ ...enrichBand(db, band), status: band.status, createdAt: band.createdAt, updatedAt: band.updatedAt, withdrawnAt: band.withdrawnAt }));
 }
 
 async function handle(req, res) {
@@ -198,10 +146,12 @@ async function handle(req, res) {
       endBeat: Number(body.endBeat),
       laneRange: body.laneRange,
       checked: Boolean(body.checked),
-      note: body.note || ""
+      note: body.note || "",
+      reviewState: "normal",
+      faultBandId: null
     };
     db.sections.push(section);
-    await writeDb(db);
+    await recomputeAndSave(db, tuneId);
     return send(res, 201, { data: section });
   }
 
@@ -215,6 +165,22 @@ async function handle(req, res) {
   const progressMatch = pathname.match(/^\/tunes\/([^/]+)\/progress$/);
   if (progressMatch && req.method === "GET") {
     return send(res, 200, { data: buildProgress(db, progressMatch[1]) });
+  }
+
+  const faultBandsMatch = pathname.match(/^\/tunes\/([^/]+)\/fault-bands$/);
+  if (faultBandsMatch && req.method === "GET") {
+    const tuneId = faultBandsMatch[1];
+    findTune(db, tuneId);
+    const includeWithdrawn = searchParams.get("include") === "withdrawn";
+    return send(res, 200, { data: listFaultBands(db, tuneId, includeWithdrawn) });
+  }
+
+  const analyzeMatch = pathname.match(/^\/tunes\/([^/]+)\/fault-bands\/analyze$/);
+  if (analyzeMatch && req.method === "POST") {
+    const tuneId = analyzeMatch[1];
+    findTune(db, tuneId);
+    await recomputeAndSave(db, tuneId);
+    return send(res, 200, { data: listFaultBands(db, tuneId, searchParams.get("include") === "withdrawn") });
   }
 
   const checkMatch = pathname.match(/^\/sections\/([^/]+)\/check$/);
@@ -254,8 +220,14 @@ async function handle(req, res) {
       resolvedAt: null
     };
     db.issues.push(issue);
-    await writeDb(db);
-    return send(res, 201, { data: issue });
+    // 登记问题后立即按拍号和音轨分析相邻区间，必要时归成故障带
+    await recomputeAndSave(db, body.tuneId);
+    const result = {
+      issue,
+      review: buildReviewProgress(db, body.tuneId),
+      faultBands: listFaultBands(db, body.tuneId, false)
+    };
+    return send(res, 201, { data: result });
   }
 
   const issueStatusMatch = pathname.match(/^\/issues\/([^/]+)\/status$/);
@@ -267,17 +239,41 @@ async function handle(req, res) {
     issue.status = body.status;
     issue.resolvedAt = body.status === "resolved" ? new Date().toISOString() : null;
     issue.note = body.note ?? issue.note;
-    await writeDb(db);
-    return send(res, 200, { data: issue });
+    // 重试通过后重算：连边消失则撤下故障带，原问题记录保留
+    await recomputeAndSave(db, issue.tuneId);
+    const result = {
+      issue,
+      review: buildReviewProgress(db, issue.tuneId),
+      faultBands: listFaultBands(db, issue.tuneId, false)
+    };
+    return send(res, 200, { data: result });
   }
 
   return send(res, 404, { error: "接口不存在", routes });
+}
+
+// 启动时把故障带分析与复核状态补齐到已有数据（没有问题的老曲目维持普通处理）
+async function syncExistingData() {
+  const db = await readDb();
+  const result = reconcileAll(db, { idMaker: makeId });
+  if (result.changed) await writeDb(db);
 }
 
 const server = http.createServer((req, res) => {
   handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
 });
 
-server.listen(PORT, () => {
-  console.log(`Organ strip punch API running at http://127.0.0.1:${PORT}`);
-});
+if (require.main === module) {
+  syncExistingData()
+    .then(() => {
+      server.listen(PORT, () => {
+        console.log(`Organ strip punch API running at http://127.0.0.1:${PORT}`);
+      });
+    })
+    .catch((error) => {
+      console.error("启动时分析已有数据失败：", error);
+      process.exit(1);
+    });
+}
+
+module.exports = { handle, server, syncExistingData };
